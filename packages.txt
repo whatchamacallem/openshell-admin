@@ -1,0 +1,29 @@
+# packages.txt — apt packages baked into the seafox sandbox image.
+#
+# One package per line. Blank lines and '#' comments are ignored.
+# Edit this list, then rebuild: ./build-image.sh (or just ./create-sandbox.sh,
+# which rebuilds the image). apt runs at image BUILD time as root, so no sudo
+# is needed and the tools survive sandbox recreates.
+
+# --- C/C++ toolchain ---
+ccache
+clang
+clang-tidy
+libclang-rt-dev
+cmake
+doxygen
+g++
+g++-multilib
+gcc-multilib
+gcovr
+gdb
+gdb-multiarch
+libc++-dev
+llvm
+llvm-dev
+musl
+musl-dev
+musl-tools
+ninja-build
+procps
+universal-ctags

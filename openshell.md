@@ -146,60 +146,83 @@ The only path between WSL and the sandbox is the `openshell ssh-proxy`
 transport tunnel, which grants the in-container process no filesystem,
 credential, or network access to WSL.
 
-## KNOWN BLOCKER — VS Code terminal fails: `forkpty(3) failed` (2026-06-17)
+## SOLVED — VS Code terminal `forkpty(3) failed` was a Landlock policy gap (2026-06-17)
 
-Opening a terminal in the VS Code Remote-SSH session into the sandbox fails:
+**Symptom:** any in-sandbox PTY allocation by the unprivileged `sandbox` user
+(uid 998) — VS Code's terminal, `tmux`, a C `forkpty`, Python `pty.fork()` —
+failed with `EACCES` (errno 13) / "out of pty devices", while the SSH *login*
+shell worked.
 
-> The terminal process failed to launch: A native exception occurred during
-> launch (forkpty(3) failed.).
+**Root cause:** the supervisor applies a **default-deny Landlock** ruleset built
+**only** from `filesystem_policy.read_only/read_write` (+ workdir), in
+`openshell-supervisor-process/src/sandbox/linux/landlock.rs`. The default policy
+never lists `/dev/pts`, so a uid-998 process that opens `/dev/ptmx` to allocate
+a *new* pty is denied. Not the VM driver (gateway runs `driver=docker`), not
+devpts perms (`/dev/ptmx` is 777, but Landlock overrides DAC), not seccomp
+(default-Allow, returns EPERM not EACCES). The login shell works because **root**
+opens its pty *before* Landlock; VS Code's server calls `forkpty` itself, *after*
+Landlock → denied.
 
-### Root cause (confirmed, not theory)
+**Fix:** add `/dev/pts` to `read_write` in the sandbox policy, then create with
+`--policy`. `filesystem_policy` is static — must be set at create time. List the
+`/dev/pts` *directory*, not `/dev/ptmx` (a symlink: the supervisor chowns
+read_write paths and refuses to chown symlinks). See
+[`sea-fox-policy.yaml`](sea-fox-policy.yaml).
 
-The unprivileged `sandbox` user (uid 998) **cannot `forkpty`** inside the
-OpenShell container — opening `/dev/ptmx` returns `EACCES` (errno 13), so no
-pty can be allocated. The OpenShell **VM driver mounts devpts itself**, and its
-setup does not give the unprivileged user a working ptmx:
-
-```sh
-# /usr/libexec/openshell/openshell-driver-vm
-mount -t devpts devpts "$(root_path /dev/pts)" 2>/dev/null &
+```bash
+openshell sandbox create --name dev --policy ./sea-fox-policy.yaml --editor vscode
 ```
 
-### What was tested (so you don't repeat it)
+**Verified (2026-06-17):** default policy → `forkpty FAILED (errno 13)` /
+`OSError: out of pty devices`; with `/dev/pts` in read_write → `forkpty OK
+(uid=998)`, interactive `tty` → `/dev/pts/0`, Python `pty.fork()` succeeds.
 
-- **It is NOT the image or Docker.** A plain `docker run` of the *same* image
-  (`ghcr.io/nvidia/.../sandboxes/base:latest`) as uid 998, with the default
-  seccomp profile, runs `forkpty` successfully. Verified with a C `forkpty`
-  test program — "forkpty OK".
-- **It is NOT seccomp.** `seccomp=unconfined` made no difference; default
-  profile works fine under plain `docker run`.
-- **It is NOT a startup race.** A freshly created sandbox fails identically —
-  the failure is deterministic. (An earlier delete+recreate on a race theory
-  was wrong and only lost the old container's contents. Do not bother
-  recreating as a fix.)
-- **It is NOT simply group membership.** Adding `sandbox` to group `tty`
-  (gid 5) lets a *fresh `docker exec`* open ptmx, but `forkpty` over SSH still
-  fails — the SSH login and the driver's devpts instance are the difference.
-- **Root inside the container CAN open ptmx**; the unprivileged user cannot.
-  Host-side remount attempts (`mount -t devpts -o newinstance …`) failed
-  because the original `/dev/pts` is busy and can't be cleanly unmounted from
-  a running container.
+Upstream-worthy: the **default** sandbox policy should include `/dev/pts` so
+terminals work out of the box. See
+[`BUG-REPORT-devpts-forkpty.md`](BUG-REPORT-devpts-forkpty.md).
 
-### Conclusion / next attempt
+## Egress policy
 
-This is an **OpenShell driver bug** in how it sets up devpts for the
-unprivileged sandbox user. Avenues to try next time:
+The sandbox routes all outbound traffic through a proxy that defaults to
+**deny**. A sandbox with no `network_policies` blocks every CONNECT
+(`fatal: ... CONNECT tunnel failed, response 403`). To allow egress, add a
+`network_policies` block to the sandbox policy and create with `--policy`
+(network policy is set at create time only — there is no hot-update verb).
 
-1. Check for a newer OpenShell release that fixes the driver's devpts mount.
-2. Look for a sandbox-create option / policy / setting that controls the run
-   user, tty-group membership, or devpts/privileged mode
-   (`openshell settings`, `openshell policy`, `openshell sandbox create --help`).
-3. If patching the driver: make it mount devpts with a proper `newinstance`
-   instance whose `/dev/ptmx` is openable by the unprivileged user, OR run the
-   agent user in group `tty` from container start (not added later).
-4. Reproducer to attach to an upstream bug report: inside any sandbox, run a C
-   program calling `forkpty()` as the `sandbox` user → `Permission denied`;
-   the same program in a plain `docker run` of the same image → succeeds.
+Rules (enforced by the supervisor at startup; a bad value crash-loops the
+container):
+
+- Each entry matches **both** an endpoint (host + port) **and** a binary
+  (resolved `/proc/<pid>/exe`). `binaries: [{ path: "/**" }]` allows any binary.
+- No `*`/`**` bare host (rejected: "matches all hosts"); no TLD wildcard
+  (`*.com`). Widest legal host is `**.<domain>` (recursive wildcard, ≥3 labels).
+- `**.<domain>` matches **subdomains only** — the glob delimiter is `.`, so it
+  does **not** match the apex. List the apex (`github.com`) **and** the wildcard
+  (`**.github.com`) to cover both.
+- No port wildcard; enumerate ports (e.g. `[80, 443]`).
+
+[`sea-fox-policy.yaml`](sea-fox-policy.yaml) allows GitHub (apex + subdomains),
+Anthropic, `claude.ai`, and `claude.com` (Claude Code). Add a
+`{ host: "**.<domain>", ports: [443] }` line per host
+family the agent needs (e.g. `pypi.org`, `registry.npmjs.org`).
+
+```bash
+openshell sandbox exec -n <name> -- git clone https://github.com/owner/repo.git
+```
+
+## Sandbox image / apt packages
+
+The sandbox runs as unprivileged `sandbox` (uid 998, no root/`sudo`) with `/usr`
+read-only, so `apt install` cannot run inside it. apt packages are baked into a
+custom image at build time instead: [`Dockerfile`](Dockerfile) is
+`FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest` + the toolchain
+in [`packages.txt`](packages.txt). [`build-image.sh`](build-image.sh) builds it
+into the local Docker daemon as `seafox-sandbox:latest`; `create-sandbox.sh`
+rebuilds then creates with `--from "${IMAGE}"`.
+
+To add a package: edit [`packages.txt`](packages.txt), then
+`./delete-sandbox.sh && ./create-sandbox.sh`. The image build runs in WSL's
+Docker (unrestricted network), not under the sandbox egress policy.
 
 ## Notes / caveats
 

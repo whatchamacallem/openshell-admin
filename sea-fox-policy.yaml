@@ -1,0 +1,80 @@
+# Test policy: proves the forkpty/EACCES blocker is a Landlock allowlist gap.
+#
+# Root cause: OpenShell's supervisor applies a default-deny Landlock ruleset
+# built ONLY from filesystem_policy.read_only/read_write (+ workdir). The
+# default policy never lists /dev/pts or /dev/ptmx, so any uid-998 process
+# that opens /dev/ptmx to allocate a NEW pty (VS Code server, tmux, forkpty)
+# is denied with EACCES (errno 13) — even though the device nodes are 0666/0777.
+#
+# Fix: add /dev/pts and /dev/ptmx to the Landlock allowlist so PTY allocation
+# works for the unprivileged sandbox user.
+#
+# filesystem_policy is a STATIC field — it cannot be hot-updated. Must be set
+# at `openshell sandbox create --policy ./sea-fox-policy.yaml`.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /proc
+    - /etc
+    - /dev/urandom
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+    - /dev/zero
+    - /dev/tty
+    # --- the fix: allow PTY allocation ---
+    # /dev/pts is the devpts mount; /dev/ptmx is a symlink into it
+    # (/dev/pts/ptmx), so allowing the directory covers ptmx too.
+    # Do NOT list /dev/ptmx directly: the supervisor chowns read_write
+    # paths and refuses to chown a symlink (privilege-escalation guard).
+    - /dev/pts
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# --- Egress: as-open-as-the-product-allows (user asked for allow-all) ---
+# True allow-all is intentionally rejected by the supervisor: a bare '*'/'**'
+# host wildcard fails L7 validation ("matches all hosts"), and TLD wildcards
+# like '*.com' are rejected too (l7/mod.rs:validate_host_wildcard). The widest
+# legal pattern is '**.<domain>' — a recursive wildcard as the entire first
+# DNS label, with >=3 labels — which matches the apex and every subdomain.
+# Binary is unrestricted ('/**'); ports are enumerated (no port wildcard in the
+# rego). Add a '**.<domain>' line per host family you need.
+network_policies:
+  egress:
+    name: egress
+    # NOTE: '**.github.com' matches subdomains only — the glob delimiter is '.'
+    # so it does NOT match the apex 'github.com'. List the apex explicitly too.
+    endpoints:
+      - { host: "github.com", ports: [80, 443] }               # apex: git clone/pull/push
+      - { host: "**.github.com", ports: [80, 443] }            # api, codeload, etc.
+      - { host: "githubusercontent.com", ports: [443] }
+      - { host: "**.githubusercontent.com", ports: [443] }     # raw, *.githubusercontent
+      - { host: "anthropic.com", ports: [443] }
+      - { host: "**.anthropic.com", ports: [443] }             # api.anthropic.com — Claude
+      - { host: "claude.ai", ports: [443] }                    # claude.ai/install.sh
+      - { host: "**.claude.ai", ports: [443] }                 # downloads.claude.ai — the binary
+      - { host: "claude.com", ports: [443] }                   # apex
+      - { host: "**.claude.com", ports: [443] }                # platform.claude.com — Claude Code runtime API
+      # --- VS Code Marketplace: installing extensions into the remote server ---
+      - { host: "marketplace.visualstudio.com", ports: [443] } # extension metadata + VSIX query
+      - { host: "**.vsassets.io", ports: [443] }               # gallerycdn.vsassets.io — VSIX download CDN
+      - { host: "**.vo.msecnd.net", ports: [443] }             # msecnd CDN — VSIX assets
+      - { host: "**.prss.microsoft.com", ports: [443] }        # vscode.download.prss — server/extension downloads
+      - { host: "update.code.visualstudio.com", ports: [443] } # server build downloads
+    binaries:
+      - { path: "/**" }
